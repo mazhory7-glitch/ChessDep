@@ -38,6 +38,7 @@ class Case(Base):
     id:Mapped[int]=mapped_column(primary_key=True); name:Mapped[str]=mapped_column(String(80)); price:Mapped[int]=mapped_column(Integer); kind:Mapped[str]=mapped_column(String(12))
 class Match(Base):
     __tablename__='matches'
+    equipment:Mapped[str]=mapped_column(Text,default='{}')
     id:Mapped[int]=mapped_column(primary_key=True); white_id:Mapped[int]=mapped_column(ForeignKey('users.id')); black_id:Mapped[int]=mapped_column(ForeignKey('users.id')); control:Mapped[str]=mapped_column(String(8)); fen:Mapped[str]=mapped_column(Text); pgn:Mapped[str]=mapped_column(Text,default=''); status:Mapped[str]=mapped_column(String(12),default='active'); result:Mapped[str]=mapped_column(String(30),default=''); dep_white:Mapped[int]=mapped_column(Integer,default=0); dep_black:Mapped[int]=mapped_column(Integer,default=0); dep_used:Mapped[bool]=mapped_column(Boolean,default=False); white_ms:Mapped[int]=mapped_column(Integer,default=180000); black_ms:Mapped[int]=mapped_column(Integer,default=180000); increment_ms:Mapped[int]=mapped_column(Integer,default=2000); clock_updated:Mapped[float]=mapped_column(Float,default=time.time); bot_game:Mapped[bool]=mapped_column(Boolean,default=False); created:Mapped[datetime]=mapped_column(DateTime,default=lambda:datetime.now(timezone.utc))
 class MatchQueue(Base):
     __tablename__='match_queue'
@@ -54,7 +55,7 @@ with engine.begin() as _conn:
       _columns={row[1] for row in _conn.exec_driver_sql('PRAGMA table_info(users)').fetchall()}
       if 'session_version' not in _columns:_conn.exec_driver_sql('ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0')
       _match_columns={row[1] for row in _conn.exec_driver_sql('PRAGMA table_info(matches)').fetchall()}
-      for _name,_definition in [('white_ms','INTEGER NOT NULL DEFAULT 180000'),('black_ms','INTEGER NOT NULL DEFAULT 180000'),('increment_ms','INTEGER NOT NULL DEFAULT 2000'),('clock_updated','FLOAT NOT NULL DEFAULT 0'),('bot_game','BOOLEAN NOT NULL DEFAULT 0')]:
+      for _name,_definition in [('equipment',"TEXT NOT NULL DEFAULT '{}'"),('white_ms','INTEGER NOT NULL DEFAULT 180000'),('black_ms','INTEGER NOT NULL DEFAULT 180000'),('increment_ms','INTEGER NOT NULL DEFAULT 2000'),('clock_updated','FLOAT NOT NULL DEFAULT 0'),('bot_game','BOOLEAN NOT NULL DEFAULT 0')]:
         if _name not in _match_columns:_conn.exec_driver_sql(f'ALTER TABLE matches ADD COLUMN {_name} {_definition}')
       _conn.exec_driver_sql('UPDATE matches SET clock_updated=? WHERE clock_updated=0',(time.time(),))
 ph=PasswordHasher(); app=FastAPI(title='ChessDep')
@@ -86,11 +87,10 @@ def dep_chance(source_type:int,target_type:int)->float:
     return FIGURE_VALUES[source_type]/FIGURE_VALUES[target_type]
 def db():
     with Session(engine) as s: yield s
-def token(user_id:int):
-    u_version=None
-    with Session(engine) as s:
-      u=s.get(User,user_id);u_version=u.session_version if u else 0
-    raw=f'{user_id}:{int(time.time())+86400}:{u_version}'; sig=hmac.new(session_secret(),raw.encode(),hashlib.sha256).hexdigest(); return raw+'.'+sig
+def token(user_id:int,version:int=0):
+    raw=f'{user_id}:{int(time.time())+86400}:{version}'
+    sig=hmac.new(session_secret(),raw.encode(),hashlib.sha256).hexdigest()
+    return raw+'.'+sig
 def current(request:Request,s:Session=Depends(db)):
     t=request.cookies.get('session','')
     try:
@@ -107,7 +107,17 @@ def wallet(s,u,amount,label):
     result=s.execute(update(User).where(User.id==u.id,User.balance+amount>=0).values(balance=User.balance+amount))
     if result.rowcount!=1: raise HTTPException(400,'Недостаточно кристаллов.')
     s.refresh(u);s.add(Ledger(user_id=u.id,amount=amount,label=label))
-def skin_json(skin): return {'id':skin.id,'name':skin.name,'kind':skin.kind,'piece':skin.piece,'rarity':skin.rarity,'value':skin.value,'color':skin.color,'light':skin.light,'dark':skin.dark,'collection':skin.collection}
+def skin_json(skin): return {'id':skin.id,'name':skin.name,'kind':skin.kind,'piece':skin.piece,'rarity':skin.rarity,'value':skin.value,'color':skin.color,'light':skin.light,'dark':skin.dark,'collection':skin.collection,'target':skin.target}
+def ensure_unlisted(s,it):
+    if s.scalar(select(Listing.id).where(Listing.item_id==it.id,Listing.status=='active')):
+      raise HTTPException(400,'Сначала снимите предмет с продажи.')
+def equipment_snapshot(s,white_id,black_id):
+    result={}
+    for side,uid in [('white',white_id),('black',black_id)]:
+      result[side]={}
+      for it in s.scalars(select(Item).where(Item.user_id==uid,Item.equipped==True)):
+        skin=s.get(Skin,it.skin_id);result[side][skin.piece]=skin_json(skin)
+    return json.dumps(result)
 def item_json(s,it):
     sk=s.get(Skin,it.skin_id); return {'id':it.id,'wear':it.wear,'equipped':it.equipped,'skin':skin_json(sk)}
 def seed():
@@ -151,14 +161,14 @@ def register(b:Credentials,response:Response,s:Session=Depends(db)):
     if not re.fullmatch(r'[A-Za-z0-9_-]{3,16}',b.login): raise HTTPException(400,'Логин: 3–16 символов, латиница, цифры, _ или -.')
     if '@' not in b.email or len(b.password)<8: raise HTTPException(400,'Проверьте email и пароль (не менее 8 символов).')
     if s.scalar(select(User).where((User.login==b.login)|(User.email==b.email))): raise HTTPException(409,'Логин или email уже зарегистрирован.')
-    u=User(login=b.login,email=b.email,password=ph.hash(b.password));u.role='player';s.add(u);s.flush();s.add(Ledger(user_id=u.id,amount=1000,label='Бонус за регистрацию'));s.commit();response.set_cookie('session',token(u.id),httponly=True,samesite='lax',secure=False,max_age=86400);return {'ok':True}
+    u=User(login=b.login,email=b.email,password=ph.hash(b.password));u.role='player';s.add(u);s.flush();s.add(Ledger(user_id=u.id,amount=1000,label='Бонус за регистрацию'));s.commit();response.set_cookie('session',token(u.id,u.session_version),httponly=True,samesite='lax',secure=False,max_age=86400);return {'ok':True}
 @app.post('/api/login')
 def login(b:Credentials,response:Response,s:Session=Depends(db)):
     u=s.scalar(select(User).where(User.login==b.login))
     try: valid=u and ph.verify(u.password,b.password)
     except VerifyMismatchError: valid=False
     if not valid: raise HTTPException(401,'Неверный логин или пароль.')
-    response.set_cookie('session',token(u.id),httponly=True,samesite='lax',secure=False,max_age=86400);return {'ok':True}
+    response.set_cookie('session',token(u.id,u.session_version),httponly=True,samesite='lax',secure=False,max_age=86400);return {'ok':True}
 @app.post('/api/logout')
 def logout(response:Response,u=Depends(current),s:Session=Depends(db)):
     u.session_version+=1;s.commit();response.delete_cookie('session');return {'ok':True}
@@ -177,6 +187,7 @@ def inventory(u=Depends(current),s:Session=Depends(db)):
 def equip(b:IdBody,u=Depends(current),s:Session=Depends(db)):
     it=s.get(Item,b.id)
     if not it or it.user_id!=u.id: raise HTTPException(404,'Предмет не найден.')
+    ensure_unlisted(s,it)
     sk=s.get(Skin,it.skin_id)
     for old in s.scalars(select(Item).where(Item.user_id==u.id,Item.equipped==True)).all():
       if s.get(Skin,old.skin_id).piece==sk.piece:old.equipped=False
@@ -235,6 +246,7 @@ def gift(b:GiftBody,u=Depends(current),s:Session=Depends(db)):
     it=s.get(Item,b.item_id);recipient=s.scalar(select(User).where(User.login==b.login))
     if not it or it.user_id!=u.id:raise HTTPException(404,'Предмет не найден.')
     if not recipient or recipient.id==u.id:raise HTTPException(400,'Укажите логин другого игрока.')
+    ensure_unlisted(s,it)
     it.user_id=recipient.id;it.equipped=False;s.add(Gift(item_id=it.id,sender_id=u.id,recipient_id=recipient.id,note=b.note));s.commit();return {'ok':True}
 @app.get('/api/gifts')
 def gifts(u=Depends(current),s:Session=Depends(db)):
@@ -256,6 +268,7 @@ def ledger(u=Depends(current),s:Session=Depends(db)):return [{'amount':x.amount,
 def upgrade(b:UpgradeBody,u=Depends(current),s:Session=Depends(db)):
     its=[s.get(Item,i) for i in set(b.item_ids)]
     if len(its)!=len(b.item_ids) or any(not i or i.user_id!=u.id for i in its):raise HTTPException(400,'Выберите только свои предметы.')
+    for it in its:ensure_unlisted(s,it)
     target=s.get(Skin,b.target_skin)
     if not target or not target.target:raise HTTPException(400,'Этот скин нельзя выбрать целью.')
     chance=sum(s.get(Skin,i.skin_id).value for i in its)/target.value*.95
@@ -280,7 +293,7 @@ def create_match(control:str='3+2',u=Depends(current),s:Session=Depends(db)):
     opponent=s.scalar(select(MatchQueue).where(MatchQueue.control==control,MatchQueue.status=='waiting',MatchQueue.user_id!=u.id).order_by(MatchQueue.created).with_for_update())
     if not opponent:
       s.commit();return {'status':'searching','control':control}
-    m=Match(white_id=opponent.user_id,black_id=u.id,control=control,fen=chess.STARTING_FEN,pgn='',white_ms=initial_ms(control),black_ms=initial_ms(control),increment_ms=2000 if control=='3+2' else 0,clock_updated=time.time());s.add(m);s.flush()
+    m=Match(white_id=opponent.user_id,black_id=u.id,control=control,fen=chess.STARTING_FEN,pgn='',white_ms=initial_ms(control),black_ms=initial_ms(control),increment_ms=2000 if control=='3+2' else 0,clock_updated=time.time(),equipment=equipment_snapshot(s,opponent.user_id,u.id));s.add(m);s.flush()
     opponent.status='paired';opponent.match_id=m.id;entry.status='paired';entry.match_id=m.id;s.commit()
     return {'id':m.id,'fen':m.fen,'status':'paired'}
 def initial_ms(control):return {'3+2':180000,'5+0':300000,'10+0':600000}[control]
@@ -292,7 +305,7 @@ def create_bot_match(control:str='3+2',u=Depends(current),s:Session=Depends(db))
     bot=s.scalar(select(User).where(User.role=='bot'))
     if not bot:
       bot=User(login='ChessDepBot',email='chessdep-bot@invalid.local',password=ph.hash(secrets.token_urlsafe(32)),role='bot',balance=0,elo=1200);s.add(bot);s.flush()
-    m=Match(white_id=u.id,black_id=bot.id,control=control,fen=chess.STARTING_FEN,pgn='',white_ms=initial_ms(control),black_ms=initial_ms(control),increment_ms=2000 if control=='3+2' else 0,clock_updated=time.time(),bot_game=True)
+    m=Match(white_id=u.id,black_id=bot.id,control=control,fen=chess.STARTING_FEN,pgn='',white_ms=initial_ms(control),black_ms=initial_ms(control),increment_ms=2000 if control=='3+2' else 0,clock_updated=time.time(),bot_game=True,equipment=equipment_snapshot(s,u.id,bot.id))
     s.add(m);s.commit();return {'id':m.id,'fen':m.fen,'status':'paired','bot':True}
 def clock_left(m,board):
     white,black=m.white_ms,m.black_ms
@@ -368,7 +381,7 @@ def match_state(mid:int,u=Depends(current),s:Session=Depends(db)):
     board=chess.Board(m.fen);white_ms,black_ms=clock_left(m,board)
     if m.status=='active' and (white_ms==0 or black_ms==0):
       m.status='finished';m.result='Время вышло · Победа чёрных' if white_ms==0 else 'Время вышло · Победа белых';m.white_ms=white_ms;m.black_ms=black_ms;s.commit()
-    return {'id':m.id,'fen':m.fen,'status':m.status,'result':m.result,'turn':'white' if board.turn else 'black','check':board.is_check(),'legal':[x.uci() for x in board.legal_moves],'pgn':m.pgn,'dep_white':m.dep_white,'dep_black':m.dep_black,'dep_used':m.dep_used,'white_id':m.white_id,'black_id':m.black_id,'white':s.get(User,m.white_id).login,'black':s.get(User,m.black_id).login,'white_ms':white_ms,'black_ms':black_ms,'clock_running':m.status=='active','control':m.control,'bot_game':m.bot_game}
+    return {'id':m.id,'fen':m.fen,'status':m.status,'result':m.result,'turn':'white' if board.turn else 'black','check':board.is_check(),'legal':[x.uci() for x in board.legal_moves],'pgn':m.pgn,'dep_white':m.dep_white,'dep_black':m.dep_black,'dep_used':m.dep_used,'white_id':m.white_id,'black_id':m.black_id,'white':s.get(User,m.white_id).login,'black':s.get(User,m.black_id).login,'white_ms':white_ms,'black_ms':black_ms,'clock_running':m.status=='active','control':m.control,'bot_game':m.bot_game,'equipment':json.loads(m.equipment or '{}')}
 @app.post('/api/matches/{mid}/move')
 def move(mid:int,b:MoveBody,u=Depends(current),s:Session=Depends(db)):
     m=s.get(Match,mid)

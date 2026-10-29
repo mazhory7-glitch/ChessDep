@@ -3,7 +3,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from fastapi.testclient import TestClient
-from app.main import app, Base, db
+from app.main import app, Base, db, Skin, Item, User
+from sqlalchemy import select
 
 class MatchmakingTests(unittest.TestCase):
     def setUp(self):
@@ -76,5 +77,18 @@ class MatchmakingTests(unittest.TestCase):
         self.assertEqual(len(state['pgn'].split()),2)
         self.assertIn('dep_white',state)
         self.assertIn('dep_black',state)
+
+    def test_equipment_is_frozen_at_match_start_and_targets_are_exposed(self):
+        with Session(self.engine) as session:
+            uid=session.scalar(select(User.id).where(User.login=='queue_a'))
+            skin=Skin(name='Конь | Лазурь',kind='figure',piece='knight',rarity='редкий',value=150,color='#38e8ff',target=True)
+            session.add(skin);session.flush()
+            item=Item(user_id=uid,skin_id=skin.id,wear=.1,equipped=True)
+            session.add(item);session.commit();item_id=item.id
+        self.assertTrue(self.a.get('/api/skins').json()[0]['target'])
+        match=self.a.post('/api/matches/bot?control=3%2B2').json()
+        self.assertEqual(self.a.post('/api/unequip',json={'id':item_id}).status_code,200)
+        state=self.a.get(f"/api/matches/{match['id']}").json()
+        self.assertEqual(state['equipment']['white']['knight']['color'],'#38e8ff')
 
 if __name__=='__main__':unittest.main()
