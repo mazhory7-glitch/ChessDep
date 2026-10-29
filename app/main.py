@@ -434,7 +434,8 @@ def dep(mid:int,b:DepBody,u=Depends(current),s:Session=Depends(db)):
     if any(candidate.is_check() for candidate in outcomes):raise HTTPException(400,'Даст шах сопернику.')
     if not charge_clock(m,board):
       m.status='finished';m.result='Время вышло';s.commit();raise HTTPException(400,'Время вышло.')
-    won=secrets.randbelow(1000000)<int(chance*1000000)
+    roll=secrets.randbelow(1000000)
+    won=roll<int(chance*1000000)
     board.remove_piece_at(square)
     if won:board.set_piece_at(square,chess.Piece(target,color))
     # A dep changes the position but does not hand the move to the opponent.
@@ -444,7 +445,7 @@ def dep(mid:int,b:DepBody,u=Depends(current),s:Session=Depends(db)):
     else:m.dep_black+=1
     m.pgn=(m.pgn+f" DEP:{b.square}:{b.target}:{'win' if won else 'loss'}:{chance:.6f}").strip()
     if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material():m.status='finished';m.result='Мат' if board.is_checkmate() else 'Ничья'
-    s.commit();return {'won':won,'chance':chance,'fen':m.fen,'status':m.status,'result':m.result}
+    s.commit();return {'won':won,'chance':chance,'roll':roll/1000000,'fen':m.fen,'status':m.status,'result':m.result}
 
 @app.get('/api/admin/users')
 def admin_users(q:str='',u=Depends(admin),s:Session=Depends(db)):return [{'id':x.id,'login':x.login,'email':x.email,'balance':x.balance,'elo':x.elo,'role':x.role} for x in s.scalars(select(User).where(User.login.contains(q)).limit(100)).all()]
