@@ -61,4 +61,20 @@ class MatchmakingTests(unittest.TestCase):
         self.assertEqual(result.json()['fen'].split()[1],'w')
         self.assertEqual(self.a.post(f"/api/matches/{match['id']}/move",json={'uci':'e2e4'}).status_code,200)
 
+    def test_bot_plays_server_generated_legal_moves_and_exposes_both_clocks(self):
+        match=self.a.post('/api/matches/bot?control=3%2B2',json={}).json()
+        state=self.a.get(f"/api/matches/{match['id']}").json()
+        self.assertTrue(state['bot_game'])
+        self.assertGreater(state['white_ms'],179000)
+        self.assertEqual(state['black_ms'],180000)
+        self.assertEqual(state['white'],'queue_a')
+        self.assertEqual(state['black'],'ChessDepBot')
+        moved=self.a.post(f"/api/matches/{match['id']}/move",json={'uci':'e2e4'})
+        self.assertEqual(moved.status_code,200,moved.text)
+        state=self.a.get(f"/api/matches/{match['id']}").json()
+        self.assertEqual(state['turn'],'white')
+        self.assertEqual(len(state['pgn'].split()),2)
+        self.assertIn('dep_white',state)
+        self.assertIn('dep_black',state)
+
 if __name__=='__main__':unittest.main()

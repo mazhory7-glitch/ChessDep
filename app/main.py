@@ -38,7 +38,7 @@ class Case(Base):
     id:Mapped[int]=mapped_column(primary_key=True); name:Mapped[str]=mapped_column(String(80)); price:Mapped[int]=mapped_column(Integer); kind:Mapped[str]=mapped_column(String(12))
 class Match(Base):
     __tablename__='matches'
-    id:Mapped[int]=mapped_column(primary_key=True); white_id:Mapped[int]=mapped_column(ForeignKey('users.id')); black_id:Mapped[int]=mapped_column(ForeignKey('users.id')); control:Mapped[str]=mapped_column(String(8)); fen:Mapped[str]=mapped_column(Text); pgn:Mapped[str]=mapped_column(Text,default=''); status:Mapped[str]=mapped_column(String(12),default='active'); result:Mapped[str]=mapped_column(String(30),default=''); dep_white:Mapped[int]=mapped_column(Integer,default=0); dep_black:Mapped[int]=mapped_column(Integer,default=0); dep_used:Mapped[bool]=mapped_column(Boolean,default=False); created:Mapped[datetime]=mapped_column(DateTime,default=lambda:datetime.now(timezone.utc))
+    id:Mapped[int]=mapped_column(primary_key=True); white_id:Mapped[int]=mapped_column(ForeignKey('users.id')); black_id:Mapped[int]=mapped_column(ForeignKey('users.id')); control:Mapped[str]=mapped_column(String(8)); fen:Mapped[str]=mapped_column(Text); pgn:Mapped[str]=mapped_column(Text,default=''); status:Mapped[str]=mapped_column(String(12),default='active'); result:Mapped[str]=mapped_column(String(30),default=''); dep_white:Mapped[int]=mapped_column(Integer,default=0); dep_black:Mapped[int]=mapped_column(Integer,default=0); dep_used:Mapped[bool]=mapped_column(Boolean,default=False); white_ms:Mapped[int]=mapped_column(Integer,default=180000); black_ms:Mapped[int]=mapped_column(Integer,default=180000); increment_ms:Mapped[int]=mapped_column(Integer,default=2000); clock_updated:Mapped[float]=mapped_column(Float,default=time.time); bot_game:Mapped[bool]=mapped_column(Boolean,default=False); created:Mapped[datetime]=mapped_column(DateTime,default=lambda:datetime.now(timezone.utc))
 class MatchQueue(Base):
     __tablename__='match_queue'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id'),unique=True); control:Mapped[str]=mapped_column(String(8)); status:Mapped[str]=mapped_column(String(12),default='waiting'); match_id:Mapped[Optional[int]]=mapped_column(ForeignKey('matches.id'),nullable=True); created:Mapped[datetime]=mapped_column(DateTime,default=lambda:datetime.now(timezone.utc))
@@ -53,6 +53,10 @@ with engine.begin() as _conn:
     if engine.dialect.name=='sqlite':
       _columns={row[1] for row in _conn.exec_driver_sql('PRAGMA table_info(users)').fetchall()}
       if 'session_version' not in _columns:_conn.exec_driver_sql('ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0')
+      _match_columns={row[1] for row in _conn.exec_driver_sql('PRAGMA table_info(matches)').fetchall()}
+      for _name,_definition in [('white_ms','INTEGER NOT NULL DEFAULT 180000'),('black_ms','INTEGER NOT NULL DEFAULT 180000'),('increment_ms','INTEGER NOT NULL DEFAULT 2000'),('clock_updated','FLOAT NOT NULL DEFAULT 0'),('bot_game','BOOLEAN NOT NULL DEFAULT 0')]:
+        if _name not in _match_columns:_conn.exec_driver_sql(f'ALTER TABLE matches ADD COLUMN {_name} {_definition}')
+      _conn.exec_driver_sql('UPDATE matches SET clock_updated=? WHERE clock_updated=0',(time.time(),))
 ph=PasswordHasher(); app=FastAPI(title='ChessDep')
 app.mount('/static',StaticFiles(directory='/app/app/static'),name='static')
 _session_secret=None
@@ -112,10 +116,24 @@ def seed():
       figure_variants=[('Мел','обычный',20),('Иней','редкий',150),('Снег','эпический',500)]
       for pname,piece,glyph in PIECES:
         for label,rarity,value in figure_variants:
-          s.add(Skin(name=f'{pname} | {label}',kind='figure',piece=piece,rarity=rarity,value=value,color='#f5f5f5',target=True))
+          skin_colors={'Мел':'#f5f5f5','Иней':'#75e6ff','Снег':'#b8c7ff'}
+          s.add(Skin(name=f'{pname} | {label}',kind='figure',piece=piece,rarity=rarity,value=value,color=skin_colors[label],target=True))
+      board_colors={'Бумага':('#c9b99b','#635443'),'Фарфор':('#d9f2ff','#51738f'),'Мрамор':('#e6e8ef','#4b5368'),'Альбион':('#f2e4bd','#4c386b')}
       for name,rarity in [('Бумага','обычный'),('Фарфор','необычный'),('Мрамор','эпический'),('Альбион','мифический')]:
-        r=next(x for x in RARITIES if x[1]==rarity);s.add(Skin(name=name,kind='board',piece='board',rarity=rarity,value=r[3],light='#454f77',dark='#262e4d',target=True))
+        r=next(x for x in RARITIES if x[1]==rarity);light,dark=board_colors[name];s.add(Skin(name=name,kind='board',piece='board',rarity=rarity,value=r[3],light=light,dark=dark,target=True))
       s.add_all([Case(name='Genesis: фигуры',price=100,kind='figure'),Case(name='Genesis: доски',price=250,kind='board')]);s.commit()
+    # Apply the named Genesis palettes to existing persistent installs too.
+    palette={'Мел':'#f5f5f5','Иней':'#75e6ff','Снег':'#b8c7ff'}
+    boards={'Бумага':('#c9b99b','#635443'),'Фарфор':('#d9f2ff','#51738f'),'Мрамор':('#e6e8ef','#4b5368'),'Альбион':('#f2e4bd','#4c386b')}
+    for skin in s.scalars(select(Skin)).all():
+      if skin.kind=='figure':
+        variant=skin.name.rsplit(' | ',1)[-1]
+        if variant in palette:skin.color=palette[variant]
+      elif skin.name in boards:skin.light,skin.dark=boards[skin.name]
+    # The bot is an internal participant and is never eligible for login.
+    if not s.scalar(select(User).where(User.login=='ChessDepBot')):
+      s.add(User(login='ChessDepBot',email='chessdep-bot@invalid.local',password=ph.hash(secrets.token_urlsafe(32)),role='bot',balance=0,elo=1200))
+    s.commit()
 seed()
 class Credentials(BaseModel): login:str; email:str=''; password:str
 class IdBody(BaseModel): id:int
@@ -231,7 +249,7 @@ def skins(s:Session=Depends(db)):return [skin_json(k) for k in s.scalars(select(
 @app.get('/api/leaderboard')
 def leaderboard(sort:str='elo',s:Session=Depends(db)):
     col=User.balance if sort=='balance' else User.elo
-    return [{'place':i+1,'login':u.login,'elo':u.elo,'balance':u.balance} for i,u in enumerate(s.scalars(select(User).order_by(col.desc()).limit(100)).all())]
+    return [{'place':i+1,'login':u.login,'elo':u.elo,'balance':u.balance} for i,u in enumerate(s.scalars(select(User).where(User.role!='bot').order_by(col.desc()).limit(100)).all())]
 @app.get('/api/ledger')
 def ledger(u=Depends(current),s:Session=Depends(db)):return [{'amount':x.amount,'label':x.label,'created':x.created.isoformat()} for x in s.scalars(select(Ledger).where(Ledger.user_id==u.id).order_by(Ledger.created.desc()).limit(100)).all()]
 @app.post('/api/upgrade')
@@ -262,9 +280,53 @@ def create_match(control:str='3+2',u=Depends(current),s:Session=Depends(db)):
     opponent=s.scalar(select(MatchQueue).where(MatchQueue.control==control,MatchQueue.status=='waiting',MatchQueue.user_id!=u.id).order_by(MatchQueue.created).with_for_update())
     if not opponent:
       s.commit();return {'status':'searching','control':control}
-    m=Match(white_id=opponent.user_id,black_id=u.id,control=control,fen=chess.STARTING_FEN,pgn='');s.add(m);s.flush()
+    m=Match(white_id=opponent.user_id,black_id=u.id,control=control,fen=chess.STARTING_FEN,pgn='',white_ms=initial_ms(control),black_ms=initial_ms(control),increment_ms=2000 if control=='3+2' else 0,clock_updated=time.time());s.add(m);s.flush()
     opponent.status='paired';opponent.match_id=m.id;entry.status='paired';entry.match_id=m.id;s.commit()
     return {'id':m.id,'fen':m.fen,'status':'paired'}
+def initial_ms(control):return {'3+2':180000,'5+0':300000,'10+0':600000}[control]
+@app.post('/api/matches/bot')
+def create_bot_match(control:str='3+2',u=Depends(current),s:Session=Depends(db)):
+    if control not in ('3+2','5+0','10+0'):raise HTTPException(400,'Неизвестный контроль времени.')
+    active=s.scalar(select(Match).where(Match.status=='active',((Match.white_id==u.id)|(Match.black_id==u.id))))
+    if active:return {'id':active.id,'fen':active.fen,'status':active.status}
+    bot=s.scalar(select(User).where(User.role=='bot'))
+    if not bot:
+      bot=User(login='ChessDepBot',email='chessdep-bot@invalid.local',password=ph.hash(secrets.token_urlsafe(32)),role='bot',balance=0,elo=1200);s.add(bot);s.flush()
+    m=Match(white_id=u.id,black_id=bot.id,control=control,fen=chess.STARTING_FEN,pgn='',white_ms=initial_ms(control),black_ms=initial_ms(control),increment_ms=2000 if control=='3+2' else 0,clock_updated=time.time(),bot_game=True)
+    s.add(m);s.commit();return {'id':m.id,'fen':m.fen,'status':'paired','bot':True}
+def clock_left(m,board):
+    white,black=m.white_ms,m.black_ms
+    elapsed=max(0,int((time.time()-m.clock_updated)*1000)) if m.status=='active' else 0
+    if board.turn:white=max(0,white-elapsed)
+    else:black=max(0,black-elapsed)
+    return white,black
+def charge_clock(m,board,add_increment=False):
+    now=time.time();elapsed=max(0,int((now-m.clock_updated)*1000))
+    if board.turn:
+      m.white_ms=max(0,m.white_ms-elapsed)
+      if m.white_ms==0:return False
+      if add_increment:m.white_ms+=m.increment_ms
+    else:
+      m.black_ms=max(0,m.black_ms-elapsed)
+      if m.black_ms==0:return False
+      if add_increment:m.black_ms+=m.increment_ms
+    m.clock_updated=now;return True
+def choose_bot_move(board):
+    values={chess.PAWN:1,chess.KNIGHT:3,chess.BISHOP:3,chess.ROOK:5,chess.QUEEN:9,chess.KING:20}
+    scored=[]
+    for move in board.legal_moves:
+      score=secrets.randbelow(100)/100
+      if board.is_capture(move):
+        victim=board.piece_at(move.to_square)
+        if board.is_en_passant(move):victim=chess.Piece(chess.PAWN,not board.turn)
+        attacker=board.piece_at(move.from_square)
+        score+=4+(values[victim.piece_type] if victim else 0)-(values[attacker.piece_type]*.12 if attacker else 0)
+      board.push(move);score+=8 if board.is_checkmate() else 1.2 if board.is_check() else 0;board.pop()
+      f=chess.square_file(move.to_square);r=chess.square_rank(move.to_square)
+      score+=max(0,2-(abs(3.5-f)+abs(3.5-r))*.25)
+      scored.append((score,move))
+    scored.sort(key=lambda x:x[0],reverse=True)
+    return secrets.choice([x[1] for x in scored[:min(4,len(scored))]])
 @app.get('/api/matches/queue')
 def queue_status(u=Depends(current),s:Session=Depends(db)):
     entry=s.scalar(select(MatchQueue).where(MatchQueue.user_id==u.id))
@@ -303,16 +365,27 @@ def send_match_chat(mid:int,b:ChatBody,u=Depends(current),s:Session=Depends(db))
 def match_state(mid:int,u=Depends(current),s:Session=Depends(db)):
     m=s.get(Match,mid)
     if not m:raise HTTPException(404,'Партия не найдена.')
-    board=chess.Board(m.fen);return {'id':m.id,'fen':m.fen,'status':m.status,'result':m.result,'turn':'white' if board.turn else 'black','check':board.is_check(),'legal':[x.uci() for x in board.legal_moves],'pgn':m.pgn,'dep_white':m.dep_white,'dep_black':m.dep_black,'dep_used':m.dep_used,'white_id':m.white_id,'black_id':m.black_id}
+    board=chess.Board(m.fen);white_ms,black_ms=clock_left(m,board)
+    if m.status=='active' and (white_ms==0 or black_ms==0):
+      m.status='finished';m.result='Время вышло · Победа чёрных' if white_ms==0 else 'Время вышло · Победа белых';m.white_ms=white_ms;m.black_ms=black_ms;s.commit()
+    return {'id':m.id,'fen':m.fen,'status':m.status,'result':m.result,'turn':'white' if board.turn else 'black','check':board.is_check(),'legal':[x.uci() for x in board.legal_moves],'pgn':m.pgn,'dep_white':m.dep_white,'dep_black':m.dep_black,'dep_used':m.dep_used,'white_id':m.white_id,'black_id':m.black_id,'white':s.get(User,m.white_id).login,'black':s.get(User,m.black_id).login,'white_ms':white_ms,'black_ms':black_ms,'clock_running':m.status=='active','control':m.control,'bot_game':m.bot_game}
 @app.post('/api/matches/{mid}/move')
 def move(mid:int,b:MoveBody,u=Depends(current),s:Session=Depends(db)):
     m=s.get(Match,mid)
     if not m or m.status!='active':raise HTTPException(404,'Активная партия не найдена.')
     if m.white_id!=u.id and m.black_id!=u.id:raise HTTPException(403,'Вы не участник партии.')
     board=chess.Board(m.fen)
+    if m.bot_game and u.id==m.white_id and not board.turn:raise HTTPException(403,'Сейчас ход бота.')
     if (board.turn and m.white_id!=u.id) or (not board.turn and m.black_id!=u.id):raise HTTPException(403,'Сейчас ход соперника.')
     if b.uci not in [x.uci() for x in board.legal_moves]:raise HTTPException(400,'Недопустимый ход.')
+    if not charge_clock(m,board,add_increment=True):
+      m.status='finished';m.result='Время вышло';s.commit();raise HTTPException(400,'Время вышло.')
     board.push_uci(b.uci);m.fen=board.fen();m.pgn=(m.pgn+' '+b.uci).strip();m.dep_used=False
+    if m.bot_game and not board.is_game_over():
+      bot_move=choose_bot_move(board)
+      if charge_clock(m,board,add_increment=True):
+        board.push(bot_move);m.fen=board.fen();m.pgn=(m.pgn+' '+bot_move.uci()).strip()
+      else:m.status='finished';m.result='Время вышло'
     if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material() or board.can_claim_threefold_repetition() or board.can_claim_fifty_moves():m.status='finished';m.result='Мат' if board.is_checkmate() else 'Ничья'
     s.commit();return {'fen':m.fen,'status':m.status,'result':m.result}
 @app.post('/api/matches/{mid}/dep')
@@ -339,6 +412,8 @@ def dep(mid:int,b:DepBody,u=Depends(current),s:Session=Depends(db)):
       candidate.turn=not color
       outcomes.append(candidate)
     if any(candidate.is_check() for candidate in outcomes):raise HTTPException(400,'Даст шах сопернику.')
+    if not charge_clock(m,board):
+      m.status='finished';m.result='Время вышло';s.commit();raise HTTPException(400,'Время вышло.')
     won=secrets.randbelow(1000000)<int(chance*1000000)
     board.remove_piece_at(square)
     if won:board.set_piece_at(square,chess.Piece(target,color))
