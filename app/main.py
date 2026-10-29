@@ -36,6 +36,11 @@ class Gift(Base):
 class Case(Base):
     __tablename__='cases'
     id:Mapped[int]=mapped_column(primary_key=True); name:Mapped[str]=mapped_column(String(80)); price:Mapped[int]=mapped_column(Integer); kind:Mapped[str]=mapped_column(String(12))
+class CaseDrop(Base):
+    __tablename__='case_drops'
+    case_id:Mapped[int]=mapped_column(ForeignKey('cases.id'),primary_key=True)
+    skin_id:Mapped[int]=mapped_column(ForeignKey('skins.id'),primary_key=True)
+    weight:Mapped[int]=mapped_column(Integer)
 class Match(Base):
     __tablename__='matches'
     equipment:Mapped[str]=mapped_column(Text,default='{}')
@@ -147,6 +152,21 @@ def seed():
           rgb=colorsys.hsv_to_rgb((rank/6+piece_index*.025)%1,.72,1)
           skin.color='#'+''.join(f'{round(c*255):02x}' for c in rgb)
       elif skin.name in boards:skin.light,skin.dark=boards[skin.name]
+    # Explicit drop pools keep premium items out of the inexpensive Genesis cases.
+    tiers=[('Рубиновый',1000,[500,1500,5000]),('Королевский',5000,[2500,7500,20000]),('Императорский',15000,[7500,20000,60000])]
+    for title,price,values in tiers:
+      case=s.scalar(select(Case).where(Case.name==title))
+      if not case:
+        case=Case(name=title,price=price,kind='figure');s.add(case);s.flush()
+      for index,(variant,rarity,weight) in enumerate([('Рубин','эпический',80),('Сапфир','легендарный',18),('Изумруд','мифический',2)]):
+        for piece_index,(pname,piece,_) in enumerate(PIECES):
+          name=f'{pname} | {title}: {variant}'
+          skin=s.scalar(select(Skin).where(Skin.name==name))
+          if not skin:
+            skin=Skin(name=name,kind='figure',piece=piece,rarity=rarity,value=values[index],collection=title,target=True);s.add(skin);s.flush()
+          rgb=colorsys.hsv_to_rgb(([0,.6,.36][index]+piece_index*.012)%1,.78,1)
+          skin.color='#'+''.join(f'{round(c*255):02x}' for c in rgb)
+          if not s.get(CaseDrop,(case.id,skin.id)):s.add(CaseDrop(case_id=case.id,skin_id=skin.id,weight=weight))
     # The bot is an internal participant and is never eligible for login.
     if not s.scalar(select(User).where(User.login=='ChessDepBot')):
       s.add(User(login='ChessDepBot',email='chessdep-bot@invalid.local',password=ph.hash(secrets.token_urlsafe(32)),role='bot',balance=0,elo=1200))
@@ -204,22 +224,27 @@ def unequip(b:IdBody,u=Depends(current),s:Session=Depends(db)):
     it=s.get(Item,b.id)
     if not it or it.user_id!=u.id:raise HTTPException(404,'Предмет не найден.')
     it.equipped=False;s.commit();return {'ok':True}
+def case_pool(s,c):
+    drops=s.execute(select(Skin,CaseDrop.weight).join(CaseDrop,CaseDrop.skin_id==Skin.id).where(CaseDrop.case_id==c.id)).all()
+    if drops:return [row[0] for row in drops],[row[1] for row in drops]
+    skins=s.scalars(select(Skin).where(Skin.kind==c.kind,Skin.collection=='Genesis')).all()
+    return skins,[CASE_RARITY_WEIGHTS.get(sk.rarity,1) for sk in skins]
 @app.get('/api/cases')
 def cases(s:Session=Depends(db)): return [{'id':c.id,'name':c.name,'price':c.price} for c in s.scalars(select(Case)).all()]
 @app.get('/api/cases/{case_id}/contents')
 def case_contents(case_id:int,s:Session=Depends(db)):
     c=s.get(Case,case_id)
     if not c:raise HTTPException(404,'Кейс не найден.')
-    pool=s.scalars(select(Skin).where(Skin.kind==c.kind)).all();total=sum(CASE_RARITY_WEIGHTS.get(sk.rarity,0) for sk in pool)
-    return {'case':c.name,'price':c.price,'drops':[{'skin':skin_json(sk),'chance':CASE_RARITY_WEIGHTS.get(sk.rarity,0)/total if total else 0} for sk in pool]}
+    pool,weights=case_pool(s,c);total=sum(weights)
+    return {'case':c.name,'price':c.price,'drops':[{'skin':skin_json(sk),'chance':weight/total if total else 0} for sk,weight in zip(pool,weights)]}
 @app.post('/api/cases/{case_id}/open')
 def open_case(case_id:int,u=Depends(current),s:Session=Depends(db)):
     c=s.get(Case,case_id)
     if not c:raise HTTPException(404,'Кейс не найден.')
     wallet(s,u,-c.price,f'Покупка кейса: {c.name}')
-    pool=s.scalars(select(Skin).where(Skin.kind==c.kind)).all()
+    pool,weights=case_pool(s,c)
     # Higher rarity has lower probability; server CSPRNG chooses outcome.
-    weights=[CASE_RARITY_WEIGHTS.get(sk.rarity,1) for sk in pool]; sk=secrets.SystemRandom().choices(pool,weights=weights,k=1)[0]
+    sk=secrets.SystemRandom().choices(pool,weights=weights,k=1)[0]
     wear=secrets.randbelow(1000001)/1000000;it=Item(user_id=u.id,skin_id=sk.id,wear=wear);s.add(it);s.flush()
     reel=[]
     for _ in range(60):
