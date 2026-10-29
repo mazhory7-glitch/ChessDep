@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, secrets, hashlib, hmac, time, json, random
+import os, secrets, hashlib, hmac, time, json, random, colorsys
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import chess
@@ -141,6 +141,11 @@ def seed():
         if variant in palette:
           colors={'pawn':['#ff4b59','#398cff','#37e890'],'knight':['#ff843d','#55d5ff','#a4f542'],'bishop':['#ed478d','#7567ff','#1ed5ae'],'rook':['#e85c35','#4579df','#7cde51'],'queen':['#ff66a6','#a16bff','#2df7c5'],'king':['#ffb23f','#4bbdeb','#60ca6c']}
           skin.color=colors.get(skin.piece,list(palette.values()))[list(palette).index(variant)]
+        else:
+          rank=next((i for i,r in enumerate(RARITIES) if r[1]==skin.rarity),0)
+          piece_index=next((i for i,p in enumerate(PIECES) if p[1]==skin.piece),0)
+          rgb=colorsys.hsv_to_rgb((rank/6+piece_index*.025)%1,.72,1)
+          skin.color='#'+''.join(f'{round(c*255):02x}' for c in rgb)
       elif skin.name in boards:skin.light,skin.dark=boards[skin.name]
     # The bot is an internal participant and is never eligible for login.
     if not s.scalar(select(User).where(User.login=='ChessDepBot')):
