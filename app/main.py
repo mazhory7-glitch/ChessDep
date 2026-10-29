@@ -126,19 +126,21 @@ def seed():
       figure_variants=[('Мел','обычный',20),('Иней','редкий',150),('Снег','эпический',500)]
       for pname,piece,glyph in PIECES:
         for label,rarity,value in figure_variants:
-          skin_colors={'Мел':'#f5f5f5','Иней':'#75e6ff','Снег':'#b8c7ff'}
+          skin_colors={'Мел':'#ff4b59','Иней':'#398cff','Снег':'#37e890'}
           s.add(Skin(name=f'{pname} | {label}',kind='figure',piece=piece,rarity=rarity,value=value,color=skin_colors[label],target=True))
       board_colors={'Бумага':('#c9b99b','#635443'),'Фарфор':('#d9f2ff','#51738f'),'Мрамор':('#e6e8ef','#4b5368'),'Альбион':('#f2e4bd','#4c386b')}
       for name,rarity in [('Бумага','обычный'),('Фарфор','необычный'),('Мрамор','эпический'),('Альбион','мифический')]:
         r=next(x for x in RARITIES if x[1]==rarity);light,dark=board_colors[name];s.add(Skin(name=name,kind='board',piece='board',rarity=rarity,value=r[3],light=light,dark=dark,target=True))
       s.add_all([Case(name='Genesis: фигуры',price=100,kind='figure'),Case(name='Genesis: доски',price=250,kind='board')]);s.commit()
     # Apply the named Genesis palettes to existing persistent installs too.
-    palette={'Мел':'#f5f5f5','Иней':'#75e6ff','Снег':'#b8c7ff'}
+    palette={'Мел':'#ff4b59','Иней':'#398cff','Снег':'#37e890'}
     boards={'Бумага':('#c9b99b','#635443'),'Фарфор':('#d9f2ff','#51738f'),'Мрамор':('#e6e8ef','#4b5368'),'Альбион':('#f2e4bd','#4c386b')}
     for skin in s.scalars(select(Skin)).all():
       if skin.kind=='figure':
         variant=skin.name.rsplit(' | ',1)[-1]
-        if variant in palette:skin.color=palette[variant]
+        if variant in palette:
+          colors={'pawn':['#ff4b59','#398cff','#37e890'],'knight':['#ff843d','#55d5ff','#a4f542'],'bishop':['#ed478d','#7567ff','#1ed5ae'],'rook':['#e85c35','#4579df','#7cde51'],'queen':['#ff66a6','#a16bff','#2df7c5'],'king':['#ffb23f','#4bbdeb','#60ca6c']}
+          skin.color=colors.get(skin.piece,list(palette.values()))[list(palette).index(variant)]
       elif skin.name in boards:skin.light,skin.dark=boards[skin.name]
     # The bot is an internal participant and is never eligible for login.
     if not s.scalar(select(User).where(User.login=='ChessDepBot')):
