@@ -294,7 +294,10 @@ def create_match(control:str='3+2',u=Depends(current),s:Session=Depends(db)):
     if active: return {'id':active.id,'fen':active.fen,'status':active.status}
     entry=s.scalar(select(MatchQueue).where(MatchQueue.user_id==u.id))
     if entry and entry.status=='paired':
-      m=s.get(Match,entry.match_id);return {'id':m.id,'fen':m.fen,'status':'paired'}
+      m=s.get(Match,entry.match_id)
+      if m.status=='active':return {'id':m.id,'fen':m.fen,'status':'paired'}
+      entry.status='waiting';entry.match_id=None;entry.control=control
+    if entry and entry.status=='cancelled':entry.status='waiting';entry.control=control
     if entry and entry.status=='waiting' and entry.control!=control:entry.control=control;entry.created=datetime.now(timezone.utc)
     if not entry:entry=MatchQueue(user_id=u.id,control=control,status='waiting');s.add(entry);s.flush()
     opponent=s.scalar(select(MatchQueue).where(MatchQueue.control==control,MatchQueue.status=='waiting',MatchQueue.user_id!=u.id).order_by(MatchQueue.created).with_for_update())
@@ -385,7 +388,15 @@ def send_match_chat(mid:int,b:ChatBody,u=Depends(current),s:Session=Depends(db))
 def match_state(mid:int,u=Depends(current),s:Session=Depends(db)):
     m=s.get(Match,mid)
     if not m:raise HTTPException(404,'Партия не найдена.')
-    board=chess.Board(m.fen);white_ms,black_ms=clock_left(m,board)
+    board=chess.Board(m.fen)
+    if m.bot_game and m.status=='active' and not board.turn and time.time()-m.clock_updated>=.8 and not board.is_game_over():
+      bot_move=choose_bot_move(board)
+      if charge_clock(m,board,add_increment=True):
+        board.push(bot_move);m.fen=board.fen();m.pgn=(m.pgn+' '+bot_move.uci()).strip();m.dep_used=False
+        if board.is_game_over():m.status='finished';m.result='Мат' if board.is_checkmate() else 'Ничья'
+      else:m.status='finished';m.result='Время вышло'
+      s.commit()
+    white_ms,black_ms=clock_left(m,board)
     if m.status=='active' and (white_ms==0 or black_ms==0):
       m.status='finished';m.result='Время вышло · Победа чёрных' if white_ms==0 else 'Время вышло · Победа белых';m.white_ms=white_ms;m.black_ms=black_ms;s.commit()
     return {'id':m.id,'fen':m.fen,'status':m.status,'result':m.result,'turn':'white' if board.turn else 'black','check':board.is_check(),'legal':[x.uci() for x in board.legal_moves],'pgn':m.pgn,'dep_white':m.dep_white,'dep_black':m.dep_black,'dep_used':m.dep_used,'white_id':m.white_id,'black_id':m.black_id,'white':s.get(User,m.white_id).login,'black':s.get(User,m.black_id).login,'white_ms':white_ms,'black_ms':black_ms,'clock_running':m.status=='active','control':m.control,'bot_game':m.bot_game,'equipment':json.loads(m.equipment or '{}')}
@@ -401,11 +412,6 @@ def move(mid:int,b:MoveBody,u=Depends(current),s:Session=Depends(db)):
     if not charge_clock(m,board,add_increment=True):
       m.status='finished';m.result='Время вышло';s.commit();raise HTTPException(400,'Время вышло.')
     board.push_uci(b.uci);m.fen=board.fen();m.pgn=(m.pgn+' '+b.uci).strip();m.dep_used=False
-    if m.bot_game and not board.is_game_over():
-      bot_move=choose_bot_move(board)
-      if charge_clock(m,board,add_increment=True):
-        board.push(bot_move);m.fen=board.fen();m.pgn=(m.pgn+' '+bot_move.uci()).strip()
-      else:m.status='finished';m.result='Время вышло'
     if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material() or board.can_claim_threefold_repetition() or board.can_claim_fifty_moves():m.status='finished';m.result='Мат' if board.is_checkmate() else 'Ничья'
     s.commit();return {'fen':m.fen,'status':m.status,'result':m.result}
 @app.post('/api/matches/{mid}/dep')
@@ -446,6 +452,33 @@ def dep(mid:int,b:DepBody,u=Depends(current),s:Session=Depends(db)):
     m.pgn=(m.pgn+f" DEP:{b.square}:{b.target}:{'win' if won else 'loss'}:{chance:.6f}").strip()
     if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material():m.status='finished';m.result='Мат' if board.is_checkmate() else 'Ничья'
     s.commit();return {'won':won,'chance':chance,'roll':roll/1000000,'fen':m.fen,'status':m.status,'result':m.result}
+
+@app.post('/api/matches/{mid}/resign')
+def resign(mid:int,u=Depends(current),s:Session=Depends(db)):
+    m=s.get(Match,mid)
+    if not m or u.id not in (m.white_id,m.black_id):raise HTTPException(403,'Вы не участник партии.')
+    if m.status!='active':raise HTTPException(400,'Партия уже закончилась.')
+    charge_clock(m,chess.Board(m.fen));m.status='finished';m.result='Сдача · Победа чёрных' if u.id==m.white_id else 'Сдача · Победа белых';s.commit();return {'ok':True}
+@app.get('/api/matches/{mid}/dep-options')
+def dep_options(mid:int,u=Depends(current),s:Session=Depends(db)):
+    m=s.get(Match,mid)
+    if not m:raise HTTPException(404,'Партия не найдена.')
+    board=chess.Board(m.fen);out={};color=board.turn
+    allowed=m.status=='active' and not m.dep_used and (m.white_id if color else m.black_id)==u.id and (m.dep_white if color else m.dep_black)<10
+    for square,piece in board.piece_map().items():
+      options=[]
+      for name,target in [('knight',2),('bishop',3),('rook',4),('queen',5)]:
+        try:chance=dep_chance(piece.piece_type,target)
+        except ValueError:continue
+        if piece.color!=color:continue
+        checks=False
+        for success in (False,True):
+          candidate=board.copy();candidate.remove_piece_at(square)
+          if success:candidate.set_piece_at(square,chess.Piece(target,color))
+          candidate.turn=not color;checks=checks or candidate.is_check()
+        options.append({'target':name,'chance':chance,'allowed':allowed and not checks,'reason':'Даст шах сопернику' if checks else '' if allowed else 'Сейчас деп недоступен'})
+      out[chess.square_name(square)]=options
+    return out
 
 @app.get('/api/admin/users')
 def admin_users(q:str='',u=Depends(admin),s:Session=Depends(db)):return [{'id':x.id,'login':x.login,'email':x.email,'balance':x.balance,'elo':x.elo,'role':x.role} for x in s.scalars(select(User).where(User.login.contains(q)).limit(100)).all()]

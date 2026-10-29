@@ -1,4 +1,5 @@
 import unittest
+import time
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -72,6 +73,7 @@ class MatchmakingTests(unittest.TestCase):
         self.assertEqual(state['black'],'ChessDepBot')
         moved=self.a.post(f"/api/matches/{match['id']}/move",json={'uci':'e2e4'})
         self.assertEqual(moved.status_code,200,moved.text)
+        time.sleep(.9)
         state=self.a.get(f"/api/matches/{match['id']}").json()
         self.assertEqual(state['turn'],'white')
         self.assertEqual(len(state['pgn'].split()),2)
