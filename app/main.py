@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, String, Integer, Float, Boolean, DateTime, ForeignKey, Text, select, func
+from sqlalchemy import create_engine, String, Integer, Float, Boolean, DateTime, ForeignKey, Text, select, func, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
 
 DB_URL=os.getenv('DATABASE_URL','sqlite:///./chessdep.db')
@@ -17,7 +17,7 @@ engine=create_engine(DB_URL,connect_args={'check_same_thread':False} if DB_URL.s
 class Base(DeclarativeBase): pass
 class User(Base):
     __tablename__='users'
-    id:Mapped[int]=mapped_column(primary_key=True); login:Mapped[str]=mapped_column(String(16),unique=True,index=True); email:Mapped[str]=mapped_column(String(254),unique=True,index=True); password:Mapped[str]=mapped_column(String(255)); role:Mapped[str]=mapped_column(String(12),default='player'); balance:Mapped[int]=mapped_column(Integer,default=1000); elo:Mapped[int]=mapped_column(Integer,default=1200); joined:Mapped[datetime]=mapped_column(DateTime,default=lambda:datetime.now(timezone.utc)); last_daily:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
+    id:Mapped[int]=mapped_column(primary_key=True); login:Mapped[str]=mapped_column(String(16),unique=True,index=True); email:Mapped[str]=mapped_column(String(254),unique=True,index=True); password:Mapped[str]=mapped_column(String(255)); role:Mapped[str]=mapped_column(String(12),default='player'); balance:Mapped[int]=mapped_column(Integer,default=1000); elo:Mapped[int]=mapped_column(Integer,default=1200); session_version:Mapped[int]=mapped_column(Integer,default=0); joined:Mapped[datetime]=mapped_column(DateTime,default=lambda:datetime.now(timezone.utc)); last_daily:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
 class Skin(Base):
     __tablename__='skins'
     id:Mapped[int]=mapped_column(primary_key=True); name:Mapped[str]=mapped_column(String(80)); kind:Mapped[str]=mapped_column(String(12)); piece:Mapped[str]=mapped_column(String(12)); rarity:Mapped[str]=mapped_column(String(16)); value:Mapped[int]=mapped_column(Integer); color:Mapped[str]=mapped_column(String(16),default='#f5f5f5'); light:Mapped[str]=mapped_column(String(16),default='#454f77'); dark:Mapped[str]=mapped_column(String(16),default='#262e4d'); target:Mapped[bool]=mapped_column(Boolean,default=True); collection:Mapped[str]=mapped_column(String(80),default='Genesis')
@@ -39,41 +39,80 @@ class Case(Base):
 class Match(Base):
     __tablename__='matches'
     id:Mapped[int]=mapped_column(primary_key=True); white_id:Mapped[int]=mapped_column(ForeignKey('users.id')); black_id:Mapped[int]=mapped_column(ForeignKey('users.id')); control:Mapped[str]=mapped_column(String(8)); fen:Mapped[str]=mapped_column(Text); pgn:Mapped[str]=mapped_column(Text,default=''); status:Mapped[str]=mapped_column(String(12),default='active'); result:Mapped[str]=mapped_column(String(30),default=''); dep_white:Mapped[int]=mapped_column(Integer,default=0); dep_black:Mapped[int]=mapped_column(Integer,default=0); dep_used:Mapped[bool]=mapped_column(Boolean,default=False); created:Mapped[datetime]=mapped_column(DateTime,default=lambda:datetime.now(timezone.utc))
+class MatchQueue(Base):
+    __tablename__='match_queue'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id'),unique=True); control:Mapped[str]=mapped_column(String(8)); status:Mapped[str]=mapped_column(String(12),default='waiting'); match_id:Mapped[Optional[int]]=mapped_column(ForeignKey('matches.id'),nullable=True); created:Mapped[datetime]=mapped_column(DateTime,default=lambda:datetime.now(timezone.utc))
+class ChatMessage(Base):
+    __tablename__='chat_messages'
+    id:Mapped[int]=mapped_column(primary_key=True); match_id:Mapped[int]=mapped_column(ForeignKey('matches.id'),index=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id')); body:Mapped[str]=mapped_column(String(500)); created:Mapped[datetime]=mapped_column(DateTime,default=lambda:datetime.now(timezone.utc))
 class AdminLog(Base):
     __tablename__='admin_log'
     id:Mapped[int]=mapped_column(primary_key=True); admin_id:Mapped[int]=mapped_column(Integer); action:Mapped[str]=mapped_column(String(120)); detail:Mapped[str]=mapped_column(Text); created:Mapped[datetime]=mapped_column(DateTime,default=lambda:datetime.now(timezone.utc))
 Base.metadata.create_all(engine)
+with engine.begin() as _conn:
+    if engine.dialect.name=='sqlite':
+      _columns={row[1] for row in _conn.exec_driver_sql('PRAGMA table_info(users)').fetchall()}
+      if 'session_version' not in _columns:_conn.exec_driver_sql('ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0')
 ph=PasswordHasher(); app=FastAPI(title='ChessDep')
 app.mount('/static',StaticFiles(directory='/app/app/static'),name='static')
+_session_secret=None
+def session_secret():
+    global _session_secret
+    if _session_secret:return _session_secret
+    configured=os.getenv('SESSION_SECRET','').strip()
+    if configured and len(configured)>=32 and configured not in ('change-me-to-a-long-random-secret','please-change-this-secret'):
+      _session_secret=configured.encode();return _session_secret
+    secret_path='/data/session_secret' if os.path.isdir('/data') else '.session_secret'
+    try:
+      with open(secret_path,'rb') as f:_session_secret=f.read().strip()
+      if len(_session_secret)>=32:return _session_secret
+    except FileNotFoundError:pass
+    _session_secret=secrets.token_bytes(48)
+    os.makedirs(os.path.dirname(secret_path) or '.',exist_ok=True)
+    fd=os.open(secret_path,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+    with os.fdopen(fd,'wb') as f:f.write(_session_secret)
+    return _session_secret
 RARITIES=[('Обычный','обычный','#9aa4b2',20),('Необычный','необычный','#38e8ff',60),('Редкий','редкий','#8b5cf6',150),('Эпический','эпический','#ffc93c',500),('Легендарный','легендарный','#ff7847',1500),('Мифический','мифический','#ff5470',5000)]
+CASE_RARITY_WEIGHTS={'обычный':799200,'необычный':159800,'редкий':32000,'эпический':6400,'легендарный':1280,'мифический':256}
 PIECES=[('Пешка','pawn','♙'),('Конь','knight','♘'),('Слон','bishop','♗'),('Ладья','rook','♖'),('Ферзь','queen','♕'),('Король','king','♔')]
+FIGURE_VALUES={chess.PAWN:1,chess.KNIGHT:3,chess.BISHOP:3,chess.ROOK:5,chess.QUEEN:9}
+def dep_chance(source_type:int,target_type:int)->float:
+    if source_type not in FIGURE_VALUES or target_type not in FIGURE_VALUES or FIGURE_VALUES[target_type]<=FIGURE_VALUES[source_type]:
+      raise ValueError('Цель должна быть фигурой большей ценности.')
+    return FIGURE_VALUES[source_type]/FIGURE_VALUES[target_type]
 def db():
     with Session(engine) as s: yield s
 def token(user_id:int):
-    raw=f'{user_id}:{int(time.time())+86400}'; sig=hmac.new(os.getenv('SESSION_SECRET','dev-secret').encode(),raw.encode(),hashlib.sha256).hexdigest(); return raw+'.'+sig
+    u_version=None
+    with Session(engine) as s:
+      u=s.get(User,user_id);u_version=u.session_version if u else 0
+    raw=f'{user_id}:{int(time.time())+86400}:{u_version}'; sig=hmac.new(session_secret(),raw.encode(),hashlib.sha256).hexdigest(); return raw+'.'+sig
 def current(request:Request,s:Session=Depends(db)):
     t=request.cookies.get('session','')
     try:
-        raw,sig=t.rsplit('.',1); uid,exp=raw.split(':'); good=hmac.compare_digest(sig,hmac.new(os.getenv('SESSION_SECRET','dev-secret').encode(),raw.encode(),hashlib.sha256).hexdigest()) and int(exp)>time.time()
+        raw,sig=t.rsplit('.',1); uid,exp,version=raw.split(':'); good=hmac.compare_digest(sig,hmac.new(session_secret(),raw.encode(),hashlib.sha256).hexdigest()) and int(exp)>time.time()
     except Exception: good=False
     u=s.get(User,int(uid)) if good else None
-    if not u: raise HTTPException(401,'Войдите в аккаунт.')
+    if not u or int(version)!=u.session_version: raise HTTPException(401,'Войдите в аккаунт.')
     return u
 def admin(u=Depends(current)):
     if u.role!='admin': raise HTTPException(404,'Страница не найдена.')
     return u
 def wallet(s,u,amount,label):
-    if u.balance+amount<0: raise HTTPException(400,'Недостаточно кристаллов.')
-    u.balance+=amount;s.add(Ledger(user_id=u.id,amount=amount,label=label))
+    # One conditional SQL UPDATE is the balance guard, including under concurrent requests.
+    result=s.execute(update(User).where(User.id==u.id,User.balance+amount>=0).values(balance=User.balance+amount))
+    if result.rowcount!=1: raise HTTPException(400,'Недостаточно кристаллов.')
+    s.refresh(u);s.add(Ledger(user_id=u.id,amount=amount,label=label))
 def skin_json(skin): return {'id':skin.id,'name':skin.name,'kind':skin.kind,'piece':skin.piece,'rarity':skin.rarity,'value':skin.value,'color':skin.color,'light':skin.light,'dark':skin.dark,'collection':skin.collection}
 def item_json(s,it):
     sk=s.get(Skin,it.skin_id); return {'id':it.id,'wear':it.wear,'equipped':it.equipped,'skin':skin_json(sk)}
 def seed():
   with Session(engine) as s:
     if s.scalar(select(func.count(Skin.id)))==0:
-      for label,slug,color,value in RARITIES:
-        for pname,piece,glyph in PIECES:
-          s.add(Skin(name=f'{pname} | {label}',kind='figure',piece=piece,rarity=slug,value=value,color='#f5f5f5',target=True))
+      figure_variants=[('Мел','обычный',20),('Иней','редкий',150),('Снег','эпический',500)]
+      for pname,piece,glyph in PIECES:
+        for label,rarity,value in figure_variants:
+          s.add(Skin(name=f'{pname} | {label}',kind='figure',piece=piece,rarity=rarity,value=value,color='#f5f5f5',target=True))
       for name,rarity in [('Бумага','обычный'),('Фарфор','необычный'),('Мрамор','эпический'),('Альбион','мифический')]:
         r=next(x for x in RARITIES if x[1]==rarity);s.add(Skin(name=name,kind='board',piece='board',rarity=rarity,value=r[3],light='#454f77',dark='#262e4d',target=True))
       s.add_all([Case(name='Genesis: фигуры',price=100,kind='figure'),Case(name='Genesis: доски',price=250,kind='board')]);s.commit()
@@ -83,6 +122,7 @@ class IdBody(BaseModel): id:int
 class PriceBody(BaseModel): item_id:int; price:int=Field(ge=1,le=10000000)
 class GiftBody(BaseModel): item_id:int; login:str; note:str=Field(default='',max_length=140)
 class MoveBody(BaseModel): uci:str
+class ChatBody(BaseModel): body:str=Field(min_length=1,max_length=500)
 class DepBody(BaseModel): square:str; target:str
 class UpgradeBody(BaseModel): item_ids:list[int]=Field(min_length=1,max_length=10); target_skin:int
 class AdminBalance(BaseModel): amount:int; comment:str=Field(min_length=3,max_length=200)
@@ -93,7 +133,7 @@ def register(b:Credentials,response:Response,s:Session=Depends(db)):
     if not re.fullmatch(r'[A-Za-z0-9_-]{3,16}',b.login): raise HTTPException(400,'Логин: 3–16 символов, латиница, цифры, _ или -.')
     if '@' not in b.email or len(b.password)<8: raise HTTPException(400,'Проверьте email и пароль (не менее 8 символов).')
     if s.scalar(select(User).where((User.login==b.login)|(User.email==b.email))): raise HTTPException(409,'Логин или email уже зарегистрирован.')
-    u=User(login=b.login,email=b.email,password=ph.hash(b.password));u.role='admin' if b.email and b.email==os.getenv('ADMIN_EMAIL') else 'player';s.add(u);s.flush();s.add(Ledger(user_id=u.id,amount=1000,label='Бонус за регистрацию'));s.commit();response.set_cookie('session',token(u.id),httponly=True,samesite='lax',secure=False,max_age=86400);return {'ok':True}
+    u=User(login=b.login,email=b.email,password=ph.hash(b.password));u.role='player';s.add(u);s.flush();s.add(Ledger(user_id=u.id,amount=1000,label='Бонус за регистрацию'));s.commit();response.set_cookie('session',token(u.id),httponly=True,samesite='lax',secure=False,max_age=86400);return {'ok':True}
 @app.post('/api/login')
 def login(b:Credentials,response:Response,s:Session=Depends(db)):
     u=s.scalar(select(User).where(User.login==b.login))
@@ -102,7 +142,8 @@ def login(b:Credentials,response:Response,s:Session=Depends(db)):
     if not valid: raise HTTPException(401,'Неверный логин или пароль.')
     response.set_cookie('session',token(u.id),httponly=True,samesite='lax',secure=False,max_age=86400);return {'ok':True}
 @app.post('/api/logout')
-def logout(response:Response): response.delete_cookie('session');return {'ok':True}
+def logout(response:Response,u=Depends(current),s:Session=Depends(db)):
+    u.session_version+=1;s.commit();response.delete_cookie('session');return {'ok':True}
 @app.get('/api/me')
 def me(u=Depends(current),s:Session=Depends(db)):
     return {'id':u.id,'login':u.login,'role':u.role,'balance':u.balance,'elo':u.elo,'new_gifts':s.scalar(select(func.count(Gift.id)).where(Gift.recipient_id==u.id,Gift.seen==False))}
@@ -129,6 +170,12 @@ def unequip(b:IdBody,u=Depends(current),s:Session=Depends(db)):
     it.equipped=False;s.commit();return {'ok':True}
 @app.get('/api/cases')
 def cases(s:Session=Depends(db)): return [{'id':c.id,'name':c.name,'price':c.price} for c in s.scalars(select(Case)).all()]
+@app.get('/api/cases/{case_id}/contents')
+def case_contents(case_id:int,s:Session=Depends(db)):
+    c=s.get(Case,case_id)
+    if not c:raise HTTPException(404,'Кейс не найден.')
+    pool=s.scalars(select(Skin).where(Skin.kind==c.kind)).all();total=sum(CASE_RARITY_WEIGHTS.get(sk.rarity,0) for sk in pool)
+    return {'case':c.name,'price':c.price,'drops':[{'skin':skin_json(sk),'chance':CASE_RARITY_WEIGHTS.get(sk.rarity,0)/total if total else 0} for sk in pool]}
 @app.post('/api/cases/{case_id}/open')
 def open_case(case_id:int,u=Depends(current),s:Session=Depends(db)):
     c=s.get(Case,case_id)
@@ -136,8 +183,13 @@ def open_case(case_id:int,u=Depends(current),s:Session=Depends(db)):
     wallet(s,u,-c.price,f'Покупка кейса: {c.name}')
     pool=s.scalars(select(Skin).where(Skin.kind==c.kind)).all()
     # Higher rarity has lower probability; server CSPRNG chooses outcome.
-    weights=[max(1,1000//max(1,sk.value)) for sk in pool]; sk=secrets.SystemRandom().choices(pool,weights=weights,k=1)[0]
-    wear=secrets.randbelow(1000001)/1000000;it=Item(user_id=u.id,skin_id=sk.id,wear=wear);s.add(it);s.commit();return {'item':item_json(s,it),'balance':u.balance}
+    weights=[CASE_RARITY_WEIGHTS.get(sk.rarity,1) for sk in pool]; sk=secrets.SystemRandom().choices(pool,weights=weights,k=1)[0]
+    wear=secrets.randbelow(1000001)/1000000;it=Item(user_id=u.id,skin_id=sk.id,wear=wear);s.add(it);s.flush()
+    reel=[]
+    for _ in range(60):
+      filler=secrets.choice(pool);reel.append(skin_json(filler))
+    win_index=47;reel[win_index]=skin_json(sk)
+    s.commit();return {'item':item_json(s,it),'balance':u.balance,'reel':reel,'win_index':win_index}
 @app.post('/api/market/list')
 def list_item(b:PriceBody,u=Depends(current),s:Session=Depends(db)):
     it=s.get(Item,b.item_id)
@@ -170,7 +222,9 @@ def gift(b:GiftBody,u=Depends(current),s:Session=Depends(db)):
 def gifts(u=Depends(current),s:Session=Depends(db)):
     rows=s.scalars(select(Gift).where((Gift.recipient_id==u.id)|(Gift.sender_id==u.id)).order_by(Gift.created.desc())).all();out=[]
     for g in rows:
-      g.seen=True;out.append({'from':s.get(User,g.sender_id).login,'to':s.get(User,g.recipient_id).login,'note':g.note,'item':item_json(s,s.get(Item,g.item_id)),'seen':g.seen})
+      is_incoming=g.recipient_id==u.id
+      out.append({'from':s.get(User,g.sender_id).login,'to':s.get(User,g.recipient_id).login,'note':g.note,'item':item_json(s,s.get(Item,g.item_id)),'seen':g.seen,'incoming':is_incoming})
+      if is_incoming:g.seen=True
     s.commit();return out
 @app.get('/api/skins')
 def skins(s:Session=Depends(db)):return [skin_json(k) for k in s.scalars(select(Skin)).all()]
@@ -200,19 +254,63 @@ def create_match(control:str='3+2',u=Depends(current),s:Session=Depends(db)):
     if control not in ('3+2','5+0','10+0'):raise HTTPException(400,'Неизвестный контроль времени.')
     active=s.scalar(select(Match).where(Match.status=='active',((Match.white_id==u.id)|(Match.black_id==u.id))))
     if active: return {'id':active.id,'fen':active.fen,'status':active.status}
-    # Solo training match provides a playable board; matchmaking can pair two sessions later.
-    m=Match(white_id=u.id,black_id=u.id,control=control,fen=chess.STARTING_FEN,pgn='');s.add(m);s.commit();return {'id':m.id,'fen':m.fen,'status':m.status}
+    entry=s.scalar(select(MatchQueue).where(MatchQueue.user_id==u.id))
+    if entry and entry.status=='paired':
+      m=s.get(Match,entry.match_id);return {'id':m.id,'fen':m.fen,'status':'paired'}
+    if entry and entry.status=='waiting' and entry.control!=control:entry.control=control;entry.created=datetime.now(timezone.utc)
+    if not entry:entry=MatchQueue(user_id=u.id,control=control,status='waiting');s.add(entry);s.flush()
+    opponent=s.scalar(select(MatchQueue).where(MatchQueue.control==control,MatchQueue.status=='waiting',MatchQueue.user_id!=u.id).order_by(MatchQueue.created).with_for_update())
+    if not opponent:
+      s.commit();return {'status':'searching','control':control}
+    m=Match(white_id=opponent.user_id,black_id=u.id,control=control,fen=chess.STARTING_FEN,pgn='');s.add(m);s.flush()
+    opponent.status='paired';opponent.match_id=m.id;entry.status='paired';entry.match_id=m.id;s.commit()
+    return {'id':m.id,'fen':m.fen,'status':'paired'}
+@app.get('/api/matches/queue')
+def queue_status(u=Depends(current),s:Session=Depends(db)):
+    entry=s.scalar(select(MatchQueue).where(MatchQueue.user_id==u.id))
+    if not entry:return {'status':'idle'}
+    if entry.status=='paired':
+      m=s.get(Match,entry.match_id);return {'status':'paired','id':m.id,'fen':m.fen,'control':m.control}
+    return {'status':entry.status,'control':entry.control}
+@app.delete('/api/matches/queue')
+def queue_cancel(u=Depends(current),s:Session=Depends(db)):
+    entry=s.scalar(select(MatchQueue).where(MatchQueue.user_id==u.id,MatchQueue.status=='waiting'))
+    if entry:entry.status='cancelled';s.commit()
+    return {'status':'idle'}
+@app.get('/api/matches/ongoing')
+def ongoing(u=Depends(current),s:Session=Depends(db)):
+    rows=s.scalars(select(Match).where(Match.status=='active').order_by(Match.created.desc()).limit(100)).all();out=[]
+    for m in rows:
+      board=chess.Board(m.fen);out.append({'id':m.id,'white':s.get(User,m.white_id).login,'black':s.get(User,m.black_id).login,'control':m.control,'ply':board.ply(),'deps':m.dep_white+m.dep_black})
+    return out
+@app.get('/api/matches/{mid}/chat')
+def match_chat(mid:int,u=Depends(current),s:Session=Depends(db)):
+    m=s.get(Match,mid)
+    if not m:raise HTTPException(404,'Партия не найдена.')
+    rows=s.scalars(select(ChatMessage).where(ChatMessage.match_id==mid).order_by(ChatMessage.created.desc()).limit(100)).all()
+    rows.reverse();out=[]
+    for x in rows:
+      role='зритель' if x.user_id not in (m.white_id,m.black_id) else ('белые' if x.user_id==m.white_id else 'чёрные')
+      out.append({'login':s.get(User,x.user_id).login,'role':role,'body':x.body,'created':x.created.isoformat()})
+    return out
+@app.post('/api/matches/{mid}/chat')
+def send_match_chat(mid:int,b:ChatBody,u=Depends(current),s:Session=Depends(db)):
+    if not s.get(Match,mid):raise HTTPException(404,'Партия не найдена.')
+    body=b.body.strip()
+    if not body:raise HTTPException(400,'Сообщение не может быть пустым.')
+    s.add(ChatMessage(match_id=mid,user_id=u.id,body=body));s.commit();return {'ok':True}
 @app.get('/api/matches/{mid}')
 def match_state(mid:int,u=Depends(current),s:Session=Depends(db)):
     m=s.get(Match,mid)
     if not m:raise HTTPException(404,'Партия не найдена.')
-    board=chess.Board(m.fen);return {'id':m.id,'fen':m.fen,'status':m.status,'result':m.result,'turn':'white' if board.turn else 'black','check':board.is_check(),'legal':[x.uci() for x in board.legal_moves],'pgn':m.pgn}
+    board=chess.Board(m.fen);return {'id':m.id,'fen':m.fen,'status':m.status,'result':m.result,'turn':'white' if board.turn else 'black','check':board.is_check(),'legal':[x.uci() for x in board.legal_moves],'pgn':m.pgn,'dep_white':m.dep_white,'dep_black':m.dep_black,'dep_used':m.dep_used,'white_id':m.white_id,'black_id':m.black_id}
 @app.post('/api/matches/{mid}/move')
 def move(mid:int,b:MoveBody,u=Depends(current),s:Session=Depends(db)):
     m=s.get(Match,mid)
     if not m or m.status!='active':raise HTTPException(404,'Активная партия не найдена.')
     if m.white_id!=u.id and m.black_id!=u.id:raise HTTPException(403,'Вы не участник партии.')
     board=chess.Board(m.fen)
+    if (board.turn and m.white_id!=u.id) or (not board.turn and m.black_id!=u.id):raise HTTPException(403,'Сейчас ход соперника.')
     if b.uci not in [x.uci() for x in board.legal_moves]:raise HTTPException(400,'Недопустимый ход.')
     board.push_uci(b.uci);m.fen=board.fen();m.pgn=(m.pgn+' '+b.uci).strip();m.dep_used=False
     if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material() or board.can_claim_threefold_repetition() or board.can_claim_fifty_moves():m.status='finished';m.result='Мат' if board.is_checkmate() else 'Ничья'
@@ -223,6 +321,7 @@ def dep(mid:int,b:DepBody,u=Depends(current),s:Session=Depends(db)):
     if not m or m.status!='active':raise HTTPException(404,'Активная партия не найдена.')
     if u.id not in (m.white_id,m.black_id):raise HTTPException(403,'Вы не участник партии.')
     board=chess.Board(m.fen); color=board.turn
+    if (color and m.white_id!=u.id) or (not color and m.black_id!=u.id):raise HTTPException(403,'Сейчас ход соперника.')
     count=m.dep_white if color else m.dep_black
     if m.dep_used:raise HTTPException(400,'За этот ход деп уже использован.')
     if count>=10:raise HTTPException(400,'Достигнут лимит депов за партию.')
@@ -230,8 +329,8 @@ def dep(mid:int,b:DepBody,u=Depends(current),s:Session=Depends(db)):
     except Exception:raise HTTPException(400,'Неверная фигура или цель депа.')
     piece=board.piece_at(square)
     if not piece or piece.color!=color or piece.piece_type==chess.KING:raise HTTPException(400,'Выберите свою фигуру, кроме короля.')
-    values={chess.PAWN:1,chess.KNIGHT:3,chess.BISHOP:3,chess.ROOK:5,chess.QUEEN:9}
-    if piece.piece_type==chess.QUEEN or values[piece.piece_type]>=values[target]:raise HTTPException(400,'Нет цели большей ценности.')
+    try:chance=dep_chance(piece.piece_type,target)
+    except ValueError:raise HTTPException(400,'Нет цели большей ценности.')
     # Neither possible result may give check to the opponent.
     outcomes=[]
     for success in (False,True):
@@ -240,11 +339,12 @@ def dep(mid:int,b:DepBody,u=Depends(current),s:Session=Depends(db)):
       candidate.turn=not color
       outcomes.append(candidate)
     if any(candidate.is_check() for candidate in outcomes):raise HTTPException(400,'Даст шах сопернику.')
-    chance=values[piece.piece_type]/values[target];won=secrets.randbelow(1000000)<int(chance*1000000)
+    won=secrets.randbelow(1000000)<int(chance*1000000)
     board.remove_piece_at(square)
     if won:board.set_piece_at(square,chess.Piece(target,color))
-    # A dep consumes the turn and updates the repetition/halfmove state.
-    board.push(chess.Move.null());m.fen=board.fen();m.dep_used=True
+    # A dep changes the position but does not hand the move to the opponent.
+    # The player who deped must still make a legal chess move this turn.
+    m.fen=board.fen();m.dep_used=True
     if color:m.dep_white+=1
     else:m.dep_black+=1
     m.pgn=(m.pgn+f" DEP:{b.square}:{b.target}:{'win' if won else 'loss'}:{chance:.6f}").strip()

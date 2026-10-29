@@ -1,5 +1,6 @@
 import unittest
 import chess
+from app.main import dep_chance
 
 class ChessRulesTests(unittest.TestCase):
     def test_standard_initial_position_has_twenty_legal_moves(self):
@@ -17,5 +18,11 @@ class ChessRulesTests(unittest.TestCase):
         mate=chess.Board('7k/6Q1/5K2/8/8/8/8/8 b - - 0 1')
         stale=chess.Board('7k/5Q2/5K2/8/8/8/8/8 b - - 0 1')
         self.assertTrue(mate.is_checkmate());self.assertTrue(stale.is_stalemate())
+
+    def test_dep_probability_is_source_value_over_stronger_target_value(self):
+        cases=[(chess.PAWN,chess.KNIGHT,1/3),(chess.PAWN,chess.BISHOP,1/3),(chess.PAWN,chess.ROOK,1/5),(chess.PAWN,chess.QUEEN,1/9),(chess.KNIGHT,chess.ROOK,3/5),(chess.BISHOP,chess.ROOK,3/5),(chess.KNIGHT,chess.QUEEN,1/3),(chess.BISHOP,chess.QUEEN,1/3),(chess.ROOK,chess.QUEEN,5/9)]
+        for source,target,expected in cases:
+            with self.subTest(source=source,target=target):self.assertAlmostEqual(dep_chance(source,target),expected)
+        with self.assertRaises(ValueError):dep_chance(chess.QUEEN,chess.KING)
 
 if __name__=='__main__':unittest.main()

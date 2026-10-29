@@ -6,7 +6,6 @@ services:
     environment:
       DATABASE_URL: sqlite:////data/chessdep.db
       SESSION_SECRET: ${SESSION_SECRET:-please-change-this-secret}
-      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
     volumes:
       - chessdep-data:/data
     restart: unless-stopped
